@@ -1,0 +1,802 @@
+---
+title: "AI Model Training and Evaluation for Trustworthy CDSS — AIDS Clinical Trial Group Study 175"
+author: "William Bertaiola and Leo Auhagen"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    theme: cosmo
+---
+
+# Introduction
+
+This laboratory aims to **develop and evaluate an AI model** for predicting patient outcomes in the *AIDS Clinical Trial Group Study 175* dataset.  
+The goal is to design a **Trustworthy Clinical Decision Support System (CDSS)** by separating the training and evaluation of the AI model from its user interface.
+
+The Dataset can be found here: https://archive.ics.uci.edu/dataset/890/aids+clinical+trials+group+study+175.
+
+Specifically, in this R Markdown we will:
+
+- **Inspect** correlation
+- **Balance** the target
+- **Train** a logistic regression classifier to predict patient death based on key clinical variables.  
+- **Perform** a proper model evaluation including ROC, Precision–Recall, and Calibration Curves.  
+- **Compute** key performance metrics such as **AUC**, **Precision**, **Recall**, **F1-score**, and **Brier score**.  
+- **Investigate** fairness metrics such as **Proportional Parity**, and **Equalized Odds**.
+- **Save** the trained model and evaluation data into an `.RData` file for later use in the **Shiny-based CDSS** interface.
+	
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  results = 'hide'
+)
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(ggplot2)
+  library(plotly)
+  library(pROC)
+  library(caret)
+  library(MLmetrics)
+  library(ROCR)
+  library(ROSE)
+  library(tidymodels)
+  library(themis) # smote
+  library(kableExtra)
+  library(randomForest)
+  library(tidyr)
+  library(xgboost)
+})
+
+set.seed(42)
+```
+
+``` {r load-data, include = FALSE}
+data_path <- "AIDS_ClinicalTrial_GroupStudy175.csv"
+df_orig <- readr::read_csv(data_path, show_col_types = FALSE)
+
+# Crea la variabile target (1 = death, 0 = alive)
+df_preprocessed <- df_orig %>%
+  mutate(target = as.factor(as.integer(label))) %>%
+  #mutate(target = as.integer(label)) %>%     # target = outcome
+  mutate(trt = factor(trt)) %>%              # treatment = feature
+  mutate_if(is.character, as.factor)
+
+# Seleziona predittori e target
+predictors <- c("age", "wtkg", "hemo", "cd40", "cd420", "trt")
+df <- df_preprocessed %>% select(all_of(c(predictors, "target"))) %>% na.omit()
+```
+
+### Correlation Analysis
+
+```{r, echo=FALSE}
+library(corrplot)
+cor_matrix <- cor(df_orig, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45)
+```
+
+Based on these findings and medical knowledge we decide to use "age", "wtkg", "hemo", "cd40", "cd420", and "trt" as predictor variables.
+
+### Class Balance
+
+Baseline Class Balance in the dataset.
+
+```{r, echo=FALSE}
+# plot class balance
+ggplot(df, aes(x = factor(target), fill = factor(target))) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.3, size = 5) +
+  scale_x_discrete(labels = c("0" = "Alive", "1" = "Death")) +
+  labs(
+    title = "Class Balance in AIDS Clinical Trial Study 175",
+    x = "Outcome",
+    y = "Number of Patients"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+Because of this big class imbalance we decided to employ Synthetic Minority Over-sampling Technique (SMOTE) to rebalance.
+
+Class Balance after using SMOTE:
+
+```{r smote_balancing, echo=FALSE}
+# Do balancing with SMOTE
+
+# Recipe: dummy-encode before SMOTE
+rec <- recipe(target ~ ., data = df) %>%
+  step_dummy(all_nominal_predictors()) %>%  # convert trt → numeric dummy vars
+  step_smote(target, over_ratio = 1)        # apply SMOTE
+
+# Apply the recipe
+df_smote <- prep(rec) %>% bake(new_data = NULL)
+df <- df_smote
+
+df$target <- as.integer(df$target)
+df$target <- df$target - 1
+df$target <- factor(df$target)
+
+df$trt <- as.integer(df$trt_X1 * 1 + df$trt_X2 * 2 + df$trt_X3 * 3 + 0)
+
+df <- df %>% select(-trt_X1, -trt_X2, -trt_X3)
+
+df$trt <- factor(df$trt)
+```
+
+``` {r split, include = FALSE}
+trainIndex <- createDataPartition(df$target, p = 0.7, list = FALSE)
+train <- df[trainIndex, ]
+test  <- df[-trainIndex, ]
+# Check class balance
+table(train$target)
+table(test$target)
+```
+
+```{r, echo=FALSE}
+# plot class balance
+ggplot(df, aes(x = factor(target), fill = factor(target))) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.3, size = 5) +
+  scale_x_discrete(labels = c("0" = "Alive", "1" = "Death")) +
+  labs(
+    title = "Class Balance in AIDS Clinical Trial Study 175",
+    x = "Outcome",
+    y = "Number of Patients"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+``` {r model, include = FALSE}
+#model_logit <- glm(target ~ ., data = train, family = binomial())
+model_logit <- randomForest(target ~ ., data = train)
+summary(model_logit)
+```
+
+# Model Performance Metrics
+
+With the balanced dataset and the selected variables we train a logistic regression model. The model performance metrics are summarized below.
+
+```{r metrics, echo=FALSE, results='asis'}
+library(glue)
+
+# --- Predizioni ---
+pred_prob <- predict(model_logit, newdata = test, type = "prob")[, "1"]
+pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+
+# --- Confusion Matrix ---
+cm <- confusionMatrix(factor(pred_class, levels=c("0","1")), test$target, positive = "1")
+
+# --- Trasforma in tabella leggibile ---
+cm_table <- as.data.frame.matrix(cm$table)
+colnames(cm_table) <- paste("Actual", colnames(cm_table))
+rownames(cm_table) <- paste("Predicted", rownames(cm_table))
+
+# --- ROC e altre metriche ---
+roc_obj <- roc(as.numeric(test$target) - 1, as.numeric(pred_prob) - 1)
+auc_val <- auc(roc_obj)
+precision <- Precision(test$target, pred_class)
+recall <- Recall(test$target, pred_class)
+f1 <- F1_Score(test$target, pred_class)
+
+# --- Threshold ottimale (Youden Index) ---
+coords <- coords(
+  roc_obj,
+  "best",
+  ret = c("threshold", "sensitivity", "specificity"),
+  best.method = "youden"
+)
+
+# --- Riepilogo metriche ---
+metrics <- data.frame(
+  Accuracy = round(cm$overall["Accuracy"], 3),
+  Precision = round(precision, 3),
+  Recall = round(recall, 3),
+  F1_Score = round(f1, 3),
+  Sensitivity = round(cm$byClass["Sensitivity"], 3),
+  Specificity = round(cm$byClass["Specificity"], 3),
+  AUC = round(auc_val, 3)
+)
+
+# --- Mostra la Confusion Matrix con stile coerente ---
+knitr::kable(cm_table, caption = "<span style='white-space: nowrap;'>Confusion Matrix (Predicted vs. Actual)</span>", digits = 0, align = "c") %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    position = "left",
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+
+# --- Tabella ordinata ---
+knitr::kable(metrics, caption = "Model Performance Metrics", digits = 3) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# ROC curve
+```{r plot-roc, fig.height=5.5, fig.width=8}
+# --- ROC Curve with AUROC annotation (no diagonal) ---
+par(mar = c(5, 5, 4, 2) + 0.1)  # margini per evitare tagli
+plot(
+  roc_obj,
+  main = "ROC Curve (AIDS Study)",
+  col = "#1f78b4",
+  lwd = 2,
+  legacy.axes = TRUE,
+  xlab = "1 - Specificity (False Positive Rate)",
+  ylab = "Sensitivity (True Positive Rate)"
+)
+text(
+  x = 0.65, y = 0.35,
+  labels = paste("AUC =", round(auc_val, 3)),
+  col = "#1f78b4", cex = 1.2, font = 2
+)
+```
+
+# PR curve
+```{r plot-pr, fig.height=5.5, fig.width=8}
+# --- Precision-Recall Curve with AUPR annotation ---
+pred_obj <- ROCR::prediction(as.numeric(pred_prob), as.numeric(test$target))
+pr <- ROCR::performance(pred_obj, "prec", "rec")
+plot(
+  pr,
+  main = "Precision–Recall Curve (AIDS Study)",
+  col = "#33a02c",
+  lwd = 2,
+  xlab = "Recall (Sensitivity)",
+  ylab = "Precision (PPV)"
+)
+aupr_obj <- ROCR::performance(pred_obj, "aucpr")
+aupr_val <- aupr_obj@y.values[[1]]
+text(
+  x = 0.55, y = 0.85,
+  labels = paste("AUPR =", round(aupr_val, 3)),
+  col = "#33a02c", cex = 1.2, font = 2
+)
+```
+
+# Calibration curve
+
+```{r calibration-curve, fig.height=5.5, fig.width=8}
+# --- Calibration Curve (Reliability Plot) with metrics ---
+
+# Divide le probabilità predette in 10 bin (decili)
+cal_df <- data.frame(
+  pred_prob = pred_prob,
+  true = as.numeric(test$target)-1
+) %>%
+  mutate(bin = ntile(pred_prob, 10)) %>%
+  group_by(bin) %>%
+  summarise(
+    mean_pred = mean(pred_prob),
+    obs_rate = mean(true)
+  )
+
+# --- Metriche di calibrazione ---
+# 1. Brier Score (errore medio quadratico)
+brier_score <- mean((pred_prob - (as.numeric(test$target)-1))^2)
+
+# 2. Calibrazione lineare: true ~ predicted
+cal_model <- glm(true ~ pred_prob, data = data.frame(true = as.numeric(test$target)-1, pred_prob = pred_prob), family = binomial())
+cal_intercept <- coef(cal_model)[1]
+cal_slope <- coef(cal_model)[2]
+
+# --- Plot Calibration Curve ---
+ggplot(cal_df, aes(x = mean_pred, y = obs_rate)) +
+  geom_point(size = 3, color = "#E41A1C") +
+  geom_line(color = "#E41A1C", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Calibration Curve (AIDS Study)",
+    subtitle = paste0(
+      "Brier Score = ", round(brier_score, 3),
+      " | Intercept = ", round(cal_intercept, 2),
+      " | Slope = ", round(cal_slope, 2)
+    ),
+    x = "Predicted probability of death",
+    y = "Observed frequency of death"
+  ) +
+  theme_minimal(base_size = 13) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  annotate("text", x = 0.7, y = 0.15, label = "Perfect calibration", color = "gray40", size = 4)
+```
+
+# Model Fairness Investigation
+
+```{r, echo=FALSE}
+library(fairness)
+features_used <- predictors
+df_preprocessed <- as.data.frame(df_preprocessed)
+
+protected_race   <- df_preprocessed$race
+protected_gender <- df_preprocessed$gender
+model_input <- df_preprocessed[, c(features_used, "target")]
+
+pred_prob <- predict(model_logit, newdata = model_input, type = "prob")[, "1"]
+pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+
+fairness_data <- data.frame(target = df_preprocessed$target, race = df_preprocessed$race, gender = df_preprocessed$gender, pred_prob = pred_prob, pred_class = pred_class);
+
+# race
+res_dem_parity_race <- dem_parity(
+  fairness_data,
+  "target",
+  "race",
+  probs = fairness_data$pred_prob,
+  preds = fairness_data$pred_class,
+  outcome_base = 0,
+  cutoff = 0.5,
+  base = NULL,
+  group_breaks = NULL
+)
+
+# gender
+res_dem_parity_gender <- dem_parity(
+  fairness_data,
+  "target",
+  "gender",
+  probs = fairness_data$pred_prob,
+  preds = fairness_data$pred_class,
+  outcome_base = 0,
+  cutoff = 0.5,
+  base = NULL,
+  group_breaks = NULL
+)
+
+# race
+res_equal_odds_race <- equal_odds(
+  fairness_data,
+  "target",
+  "race",
+  probs = fairness_data$pred_prob,
+  preds = fairness_data$pred_class,
+  outcome_base = 0,
+  cutoff = 0.5,
+  base = NULL,
+  group_breaks = NULL
+)
+
+# gender
+res_equal_odds_gender <- equal_odds(
+  fairness_data,
+  "target",
+  "gender",
+  probs = fairness_data$pred_prob,
+  preds = fairness_data$pred_class,
+  outcome_base = 0,
+  cutoff = 0.5,
+  base = NULL,
+  group_breaks = NULL
+)
+```
+
+## Demographic Parity by Gender
+```{r}
+probability_plot_gender = res_dem_parity_gender$Probability_plot
+probability_plot_gender
+```
+
+## Demographic Parity by Race
+```{r}
+probability_plot_race = res_dem_parity_race$Probability_plot
+probability_plot_race
+```
+
+## Equal Odds by Gender
+```{r}
+equal_odds_plot_gender = res_equal_odds_gender$Metric_plot
+equal_odds_plot_gender
+```
+
+## Equal Odds by Race
+```{r}
+equal_odds_plot_race = res_equal_odds_race$Metric_plot
+equal_odds_plot_race
+```
+
+```{r fairness metric, include=TRUE}
+compute_fairness_metrics <- function(data, group_var,
+                                     prob_col = "pred_prob",
+                                     true_col = "target",
+                                     pred_col = "pred_class") {
+  
+  groups <- levels(as.factor(data[[group_var]]))
+  
+  results <- lapply(groups, function(g) {
+    df <- data[data[[group_var]] == g, ]
+    
+    y_true <- as.numeric(as.character(df[[true_col]]))
+    y_pred <- df[[pred_col]]
+    
+    TP <- sum(y_true == 1 & y_pred == 1)
+    FN <- sum(y_true == 1 & y_pred == 0)
+    FP <- sum(y_true == 0 & y_pred == 1)
+    TN <- sum(y_true == 0 & y_pred == 0)
+    
+    demographic_parity <- mean(y_pred == 1)
+    TPR <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+    FPR <- ifelse((FP + TN) > 0, FP / (FP + TN), NA)
+    
+    data.frame(
+      group = g,
+      demographic_parity = demographic_parity,
+      TPR = TPR,
+      FPR = FPR
+    )
+  })
+  
+  do.call(rbind, results)
+}
+```
+
+```{r fairness gender, include=TRUE}
+fairness_gender <- compute_fairness_metrics(fairness_data, "gender")
+
+# Tabella
+kable(fairness_gender, caption = "Fairness Metrics — Gender") %>%
+  kable_styling(full_width = FALSE)
+
+# Plot Fairness
+library(tidyr)
+
+fairness_gender_long <- fairness_gender %>%
+  pivot_longer(cols = c("demographic_parity", "TPR", "FPR"),
+               names_to = "metric",
+               values_to = "value")
+
+ggplot(fairness_gender_long,
+       aes(x = metric, y = value, fill = group)) +
+  geom_col(position = "dodge") +
+  labs(title = "Fairness Metrics by Gender",
+       x = "Metric", y = "Value") +
+  theme_minimal(base_size = 14)
+```
+
+```{r fairness race, include=TRUE}
+fairness_race <- compute_fairness_metrics(fairness_data, "race")
+
+kable(fairness_race, caption = "Fairness Metrics — Race / Ethnicity") %>%
+  kable_styling(full_width = FALSE)
+
+# Plot
+fairness_race_long <- fairness_race %>%
+  pivot_longer(cols = c("demographic_parity", "TPR", "FPR"),
+               names_to = "metric",
+               values_to = "value")
+
+ggplot(fairness_race_long,
+       aes(x = metric, y = value, fill = group)) +
+  geom_col(position = "dodge") +
+  labs(title = "Fairness Metrics by Race/Ethnicity",
+       x = "Metric", y = "Value") +
+  theme_minimal(base_size = 14)
+```
+
+``` {r save-model, include = FALSE}
+save(model_logit, metrics, roc_obj, coords, cal_df, fairness_data, file = "AIDS_CDSS_model_v2.RData")
+```
+
+# Calibration Improvement
+
+We also investigated influence of post-hoc calibration improvement measures as in the study.
+
+
+```{r nested-cv-calibration-full, echo=FALSE, message=FALSE, warning=FALSE, fig.width=12, fig.height=5.5, results='asis'}
+# =====================================================
+# 1) HELPERS
+# =====================================================
+eps <- 1e-6
+clamp <- function(p) pmin(pmax(as.numeric(p), eps), 1 - eps)
+
+brier <- function(y, p) mean((clamp(p) - y)^2)
+
+logloss <- function(y, p) {
+  p <- clamp(p)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+
+ece <- function(y, p, n_bins = 10) {
+  p <- clamp(p)
+  bins <- cut(p, breaks = seq(0,1,length.out=n_bins+1), include.lowest=TRUE)
+  tibble(y=y, p=p, bin=bins) %>%
+    group_by(bin) %>%
+    summarise(acc=mean(y), conf=mean(p), n=n(), .groups="drop") %>%
+    mutate(w=n/sum(n)) %>%
+    summarise(sum(w * abs(acc-conf))) %>% pull()
+}
+
+reliability_df <- function(y, p, n_bins=10) {
+  d <- tibble(y=as.numeric(y), p=clamp(p)) %>% filter(is.finite(y), is.finite(p))
+  if (nrow(d) < 5) return(tibble(p_mean=numeric(0), y_rate=numeric(0), n=integer(0)))
+  d %>%
+    mutate(bin = ntile(p, n_bins)) %>%
+    group_by(bin) %>%
+    summarise(p_mean=mean(p), y_rate=mean(y), n=n(), .groups="drop") %>%
+    arrange(p_mean)
+}
+
+# =====================================================
+# 2) TEMPERATURE SCALING (robust)
+# =====================================================
+fit_temperature <- function(p_cal, y_cal) {
+  p_cal <- clamp(p_cal)
+  y_cal <- as.numeric(y_cal)
+
+  nll <- function(logT) {
+    T <- exp(logT)
+    pT <- plogis(qlogis(p_cal) / T)
+    -mean(y_cal*log(clamp(pT)) + (1-y_cal)*log(1-clamp(pT)))
+  }
+
+  opt <- optimize(nll, interval=c(log(1e-2), log(1e2)))
+  exp(opt$minimum)
+}
+
+# =====================================================
+# 3) CALIBRATION METHODS (robust)
+# =====================================================
+calibrate_all <- function(p_cal, y_cal, p_test) {
+
+  # ensure safe probabilities everywhere
+  p_cal  <- clamp(p_cal)
+  p_test <- clamp(p_test)
+  y_cal  <- as.numeric(y_cal)
+
+  # Uncalibrated
+  p_uncal <- p_test
+
+  # (A) Platt scaling (robust: clamp before qlogis)
+  platt_fit <- glm(y_cal ~ qlogis(p_cal), family=binomial())
+  p_platt <- plogis(predict(platt_fit, newdata=data.frame(p_cal=p_test)))
+
+  # (B) Isotonic regression (robust ordering)
+  ord <- order(p_cal)
+  iso <- isoreg(p_cal[ord], y_cal[ord])
+  p_iso <- approx(iso$x, iso$yf, xout=p_test, rule=2, ties="ordered")$y
+
+  # (C) Quantile binning (robust against empty bins)
+  n_bins <- 10
+  br <- unique(quantile(p_cal, probs=seq(0,1,length.out=n_bins+1), na.rm=TRUE))
+  if (length(br) < 3) br <- unique(seq(min(p_cal), max(p_cal), length.out=n_bins+1))
+
+  bin_tbl <- tibble(p=p_cal, y=y_cal) %>%
+    mutate(bin = cut(p, breaks=br, include.lowest=TRUE, right=TRUE)) %>%
+    group_by(bin) %>%
+    summarise(p_min=min(p), p_max=max(p), y_rate=mean(y), .groups="drop")
+
+  bin_apply <- function(p) {
+    p <- clamp(p)
+    out <- numeric(length(p))
+    for (i in seq_along(p)) {
+      idx <- which(p[i] >= bin_tbl$p_min & p[i] <= bin_tbl$p_max)
+      if (length(idx)==0) {
+        out[i] <- if (p[i] < min(bin_tbl$p_min)) bin_tbl$y_rate[which.min(bin_tbl$p_min)]
+        else bin_tbl$y_rate[which.max(bin_tbl$p_max)]
+      } else out[i] <- bin_tbl$y_rate[idx[1]]
+    }
+    clamp(out)
+  }
+  p_bin <- bin_apply(p_test)
+
+  # (D) Temperature scaling
+  T <- fit_temperature(p_cal, y_cal)
+  p_temp <- plogis(qlogis(p_test) / T)
+
+  list(
+    uncal = clamp(p_uncal),
+    platt = clamp(p_platt),
+    iso   = clamp(p_iso),
+    bin   = clamp(p_bin),
+    temp  = clamp(p_temp)
+  )
+}
+
+# =====================================================
+# 4) NESTED CV
+# =====================================================
+K <- 5
+folds <- createFolds(df$target, k=K)
+
+pooled <- list(
+  RF = list(uncal=c(), platt=c(), iso=c(), bin=c(), temp=c(), y=c()),
+  GB = list(uncal=c(), platt=c(), iso=c(), bin=c(), temp=c(), y=c())
+)
+
+metrics_all <- list()
+
+for (k in seq_along(folds)) {
+
+  test_idx <- folds[[k]]
+  train_idx <- setdiff(seq_len(nrow(df)), test_idx)
+
+  outer_train <- df[train_idx, ]
+  outer_test  <- df[test_idx, ]
+
+  inner_idx <- createDataPartition(outer_train$target, p=0.25, list=FALSE)
+  fit <- outer_train[-inner_idx, ]
+  cal <- outer_train[inner_idx, ]
+
+  y_cal  <- as.numeric(as.character(cal$target))
+  y_test <- as.numeric(as.character(outer_test$target))
+
+  # ---- Random Forest
+  rf <- model_logit
+  p_cal_rf  <- clamp(predict(rf, cal, type="prob")[,2])
+  p_test_rf <- clamp(predict(rf, outer_test, type="prob")[,2])
+  cal_rf <- calibrate_all(p_cal_rf, y_cal, p_test_rf)
+  
+  # ---- Pool
+  pooled$RF$y <- c(pooled$RF$y, y_test)
+
+  for (m in names(cal_rf)) {
+    pooled$RF[[m]] <- c(pooled$RF[[m]], cal_rf[[m]])
+  }
+
+  # ---- Metrics (per fold)
+  metrics_all[[length(metrics_all)+1]] <- tibble(
+    Fold=k, Model="Random Forest",
+    Method=c("Uncalibrated","Platt scaling","Isotonic regression","Quantile binning","Temperature scaling"),
+    ECE=c(ece(y_test, cal_rf$uncal), ece(y_test, cal_rf$platt), ece(y_test, cal_rf$iso), ece(y_test, cal_rf$bin), ece(y_test, cal_rf$temp)),
+    LogLoss=c(logloss(y_test, cal_rf$uncal), logloss(y_test, cal_rf$platt), logloss(y_test, cal_rf$iso), logloss(y_test, cal_rf$bin), logloss(y_test, cal_rf$temp)),
+    Brier=c(brier(y_test, cal_rf$uncal), brier(y_test, cal_rf$platt), brier(y_test, cal_rf$iso), brier(y_test, cal_rf$bin), brier(y_test, cal_rf$temp))
+  )
+}
+
+metrics_df <- bind_rows(metrics_all)
+
+# =====================================================
+# 5) SUMMARY TABLE (mean ± sd)
+# =====================================================
+summary_tbl <- metrics_df %>%
+  group_by(Model, Method) %>%
+  summarise(
+    ECE_mean=mean(ECE), ECE_sd=sd(ECE),
+    LogLoss_mean=mean(LogLoss), LogLoss_sd=sd(LogLoss),
+    Brier_mean=mean(Brier), Brier_sd=sd(Brier),
+    .groups="drop"
+  ) %>%
+  mutate(
+    ECE = sprintf("%.3f ± %.3f", ECE_mean, ECE_sd),
+    LogLoss = sprintf("%.3f ± %.3f", LogLoss_mean, LogLoss_sd),
+    Brier = sprintf("%.3f ± %.3f", Brier_mean, Brier_sd)
+  ) %>%
+  select(Model, Method, ECE, LogLoss, Brier)
+
+
+# =====================================================
+# 6) FIGURE 1 — RELIABILITY (RF vs GB)
+# =====================================================
+make_fig1 <- function(model_key, title_txt) {
+  y <- pooled[[model_key]]$y
+  fig1_df <- bind_rows(
+    reliability_df(y, pooled[[model_key]]$uncal, 10) %>% mutate(Method="Uncalibrated"),
+    reliability_df(y, pooled[[model_key]]$platt, 10) %>% mutate(Method="Platt scaling"),
+    reliability_df(y, pooled[[model_key]]$iso,   10) %>% mutate(Method="Isotonic regression"),
+    reliability_df(y, pooled[[model_key]]$bin,   10) %>% mutate(Method="Quantile binning"),
+    reliability_df(y, pooled[[model_key]]$temp,  10) %>% mutate(Method="Temperature scaling")
+  )
+
+  ggplot(fig1_df, aes(x=p_mean, y=y_rate, color=Method)) +
+    geom_abline(slope=1, intercept=0, linetype="dashed", color="gray40") +
+    geom_line(linewidth=1.05, alpha=0.95) +
+    geom_point(size=2.6, alpha=0.9) +
+    coord_equal(xlim=c(0,1), ylim=c(0,1)) +
+    labs(title=title_txt, x="Mean predicted probability", y="Observed event rate") +
+    theme_minimal(base_size=12) +
+    theme(legend.position="right")
+}
+
+p1_rf <- make_fig1("RF", "Figure 1a. Reliability diagram — Random Forest (pooled CV)")
+
+gridExtra::grid.arrange(p1_rf, ncol=1)
+
+# =====================================================
+# 7) FIGURE 2 — OVERLAID HIST (uncal vs best-by-ECE) [ROBUST]
+# =====================================================
+
+# Helper: map keys -> pretty names (1 posto solo)
+model_key_to_label <- function(model_key) {
+  if (model_key == "RF") return("Random Forest")
+  stop("Unknown model_key: ", model_key)
+}
+
+# Compute best method per MODEL KEY using metrics_df
+best_method_per_key <- metrics_df %>%
+  filter(Method != "Uncalibrated") %>%
+  mutate(ModelKey = ifelse(Model == "Random Forest", "RF")) %>%
+  group_by(ModelKey, Method) %>%
+  summarise(ECE = mean(ECE), LogLoss = mean(LogLoss), .groups = "drop") %>%
+  group_by(ModelKey) %>%
+  dplyr::slice(which.min(ECE)) %>%
+  ungroup() %>%
+  select(ModelKey, BestMethod = Method)
+
+# robust getter (with fallback)
+pick_probs <- function(model_key, method_name) {
+  # fallback if empty
+  if (length(method_name) == 0 || is.na(method_name)) method_name <- "Temperature scaling"
+
+  if (method_name == "Platt scaling") return(pooled[[model_key]]$platt)
+  if (method_name == "Isotonic regression") return(pooled[[model_key]]$iso)
+  if (method_name == "Quantile binning") return(pooled[[model_key]]$bin)
+  if (method_name == "Temperature scaling") return(pooled[[model_key]]$temp)
+
+  # ultimate fallback
+  pooled[[model_key]]$uncal
+}
+
+model_key = "RF"
+binwidth = 0.05
+
+model_label <- model_key_to_label(model_key)
+
+p_unc  <- pooled[[model_key]]$uncal
+p_iso <- pooled[[model_key]]$iso
+p_platt <- pooled[[model_key]]$platt
+p_bin <- pooled[[model_key]]$bin
+p_temp <- pooled[[model_key]]$temp
+
+breaks <- seq(0, 1, by = binwidth)
+
+hist_df <- tibble(
+  p = c(p_unc, p_iso, p_platt, p_bin, p_temp),
+  Stage = factor(
+    c(rep("Uncalibrated", length(p_unc)),
+      rep("Isotonic Regression", length(p_iso)),
+      rep("Platt Scaling", length(p_platt)),
+      rep("Quantile Binning", length(p_bin)),
+      rep("Temperature Scaling", length(p_temp))),
+    levels = c("Uncalibrated", "Isotonic Regression", "Platt Scaling", "Quantile Binning", "Temperature Scaling")
+  )
+)
+
+
+p <- ggplot() +
+geom_histogram(data = filter(hist_df, Stage == "Uncalibrated"), 
+               aes(x = p, fill = Stage), 
+               breaks = breaks, alpha = 0.35, position = "identity") +
+geom_histogram(data = filter(hist_df, Stage == "Isotonic Regression"), 
+               aes(x = p, fill = Stage), 
+               breaks = breaks, alpha = 0.35, position = "identity") +
+geom_histogram(data = filter(hist_df, Stage == "Platt Scaling"), 
+               aes(x = p, fill = Stage), 
+               breaks = breaks, alpha = 0.35, position = "identity") +
+geom_histogram(data = filter(hist_df, Stage == "Quantile Binning"), 
+               aes(x = p, fill = Stage), 
+               breaks = breaks, alpha = 0.35, position = "identity") +
+geom_histogram(data = filter(hist_df, Stage == "Temperature Scaling"), 
+               aes(x = p, fill = Stage), 
+               breaks = breaks, alpha = 0.35, position = "identity") +
+scale_x_continuous(limits = c(0, 1)) +
+labs(
+  title = paste0("Probability Distribution Histogram"),
+  x = "Predicted probability",
+  y = "Count",
+  fill = "Stage"
+) +
+theme_minimal(base_size = 12)
+
+# Convert to plotly — now each stage is its own trace
+p_plotly <- ggplotly(p, dynamicTicks = TRUE)
+
+enabled_stages <- c("Uncalibrated", "Platt Scaling")
+disabled_stages <- c("Isotonic Regression", "Quantile Binning", "Temperature Scaling")
+
+# Loop over traces and set visibility
+for(i in seq_along(p_plotly$x$data)) {
+  stage_name <- p_plotly$x$data[[i]]$name
+  if(stage_name %in% enabled_stages) {
+    p_plotly$x$data[[i]]$visible <- TRUE
+  } else {
+    p_plotly$x$data[[i]]$visible <- "legendonly"  # hide but keep in legend
+  }
+}
+
+p_plotly <- p_plotly %>% layout(width = 800, height = 400)
+p_plotly
+
+knitr::kable(summary_tbl, caption="Calibration metrics across methods (nested 5-fold CV).") %>%
+  kable_styling(full_width=FALSE, bootstrap_options=c("striped","hover","condensed"))
+```
