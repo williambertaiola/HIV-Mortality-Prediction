@@ -1,6 +1,6 @@
 ---
 title: "AI Model Training and Evaluation for Trustworthy CDSS — AIDS Clinical Trial Group Study 175"
-author: "William Bertaiola and Leo Auhagen"
+author: "William Bertaiola"
 output:
   html_document:
     toc: true
